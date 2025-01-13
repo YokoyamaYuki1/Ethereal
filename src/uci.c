@@ -44,6 +44,10 @@
 
 int NORMALIZE_EVAL = 1;
 
+// グローバル変数で遅延初期化フラグを管理
+int isTTInitialized = 0;
+int isNNUEInitialized = 0;
+
 extern int MoveOverhead;          // Defined by time.c
 extern unsigned TB_PROBE_DEPTH;   // Defined by syzygy.c
 extern volatile int ABORT_SIGNAL; // Defined by search.c
@@ -53,7 +57,6 @@ extern PKNetwork PKNN;            // Defined by network.c
 const char *StartPosition = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
 int main(int argc, char **argv) {
-
     Board board;
     char str[8192] = {0};
     Thread *threads;
@@ -64,9 +67,11 @@ int main(int argc, char **argv) {
     int multiPV  = 1;
 
     // Initialize core components of Ethereal
-    initAttacks(); initMasks(); initEval();
-    initSearch(); initZobrist(); tt_init(1, 16);
-    initPKNetwork(); nnue_incbin_init();
+    initAttacks();
+    initMasks();
+    initEval();
+    initSearch();
+    initZobrist();
 
     // Create the UCI-board and our threads
     threads = createThreadPool(1);
@@ -75,26 +80,7 @@ int main(int argc, char **argv) {
     // Handle any command line requests
     handleCommandLine(argc, argv);
 
-    /*
-    |------------|-----------------------------------------------------------------------|
-    |  Commands  | Response. * denotes that the command blocks until no longer searching |
-    |------------|-----------------------------------------------------------------------|
-    |        uci |           Outputs the engine name, authors, and all available options |
-    |    isready | *           Responds with readyok when no longer searching a position |
-    | ucinewgame | *  Resets the TT and any Hueristics to ensure determinism in searches |
-    |  setoption | *     Sets a given option and reports that the option was set if done |
-    |   position | *  Sets the board position via an optional FEN and optional move list |
-    |         go | *       Searches the current position with the provided time controls |
-    |  ponderhit |          Flags the search to indicate that the ponder move was played |
-    |       stop |            Signals the search threads to finish and report a bestmove |
-    |       quit |             Exits the engine and any searches by killing the UCI loop |
-    |      perft |            Custom command to compute PERFT(N) of the current position |
-    |      print |         Custom command to print an ASCII view of the current position |
-    |------------|-----------------------------------------------------------------------|
-    */
-
     while (getInput(str)) {
-
         if (strEquals(str, "uci")) {
             printf("id name Ethereal " ETHEREAL_VERSION "\n");
             printf("id author Andrew Grant, Alayan & Laldon\n");
@@ -111,7 +97,6 @@ int main(int argc, char **argv) {
             printf("info string licensed to " LICENSE_OWNER "\n");
             printf("uciok\n"), fflush(stdout);
         }
-
         else if (strEquals(str, "isready"))
             printf("readyok\n"), fflush(stdout);
 
@@ -147,11 +132,19 @@ int main(int argc, char **argv) {
 }
 
 void uciGo(UCIGoStruct *ucigo, pthread_t *pthread, Thread *threads, Board *board, int multiPV, char *str) {
+    // 遅延初期化処理
+    if (!isTTInitialized) {
+        tt_init(threads->nthreads, 16); // 必要に応じてサイズを調整
+        isTTInitialized = 1;
+    }
 
-    /// Parse the entire "go" command in order to fill out a Limits struct, found at ucigo->limits.
-    /// After we have processed all of this, we can execute a new search thread, held by *pthread,
-    /// and detach it.
+    if (!isNNUEInitialized) {
+        initPKNetwork();
+        nnue_incbin_init();
+        isNNUEInitialized = 1;
+    }
 
+    // 残りの探索処理（元のコードを保持）
     double start = get_real_time();
     double wtime = 0, btime = 0;
     double winc = 0, binc = 0, mtg = -1;
@@ -165,60 +158,47 @@ void uciGo(UCIGoStruct *ucigo, pthread_t *pthread, Thread *threads, Board *board
     Limits *limits = &ucigo->limits;
     memset(limits, 0, sizeof(Limits));
 
-    IS_PONDERING = FALSE; // Reset PONDERING every time to be safe
+    IS_PONDERING = FALSE;
 
     for (ptr = strtok(NULL, " "); ptr != NULL; ptr = strtok(NULL, " ")) {
-
-        // Parse time control conditions
-        if (strEquals(ptr, "wtime"      )) wtime    = atoi(strtok(NULL, " "));
-        if (strEquals(ptr, "btime"      )) btime    = atoi(strtok(NULL, " "));
-        if (strEquals(ptr, "winc"       )) winc     = atoi(strtok(NULL, " "));
-        if (strEquals(ptr, "binc"       )) binc     = atoi(strtok(NULL, " "));
-        if (strEquals(ptr, "movestogo"  )) mtg      = atoi(strtok(NULL, " "));
-
-        // Parse special search termination conditions
-        if (strEquals(ptr, "depth"      )) limits->depthLimit = atoi(strtok(NULL, " "));
-        if (strEquals(ptr, "movetime"   )) limits->timeLimit  = atoi(strtok(NULL, " "));
-        if (strEquals(ptr, "nodes"      )) limits->nodeLimit  = atof(strtok(NULL, " "));
-
-        // Parse special search modes
-        if (strEquals(ptr, "infinite"   )) limits->limitedByNone  = TRUE;
+        if (strEquals(ptr, "wtime")) wtime = atoi(strtok(NULL, " "));
+        if (strEquals(ptr, "btime")) btime = atoi(strtok(NULL, " "));
+        if (strEquals(ptr, "winc")) winc = atoi(strtok(NULL, " "));
+        if (strEquals(ptr, "binc")) binc = atoi(strtok(NULL, " "));
+        if (strEquals(ptr, "movestogo")) mtg = atoi(strtok(NULL, " "));
+        if (strEquals(ptr, "depth")) limits->depthLimit = atoi(strtok(NULL, " "));
+        if (strEquals(ptr, "movetime")) limits->timeLimit = atoi(strtok(NULL, " "));
+        if (strEquals(ptr, "nodes")) limits->nodeLimit = atof(strtok(NULL, " "));
+        if (strEquals(ptr, "infinite")) limits->limitedByNone = TRUE;
         if (strEquals(ptr, "searchmoves")) limits->limitedByMoves = TRUE;
-        if (strEquals(ptr, "ponder"     )) IS_PONDERING           = TRUE;
+        if (strEquals(ptr, "ponder")) IS_PONDERING = TRUE;
 
-        // Parse any specific moves that we are to search
         for (int i = 0; i < size; i++) {
             moveToString(moves[i], moveStr, board->chess960);
             if (strEquals(ptr, moveStr)) limits->searchMoves[idx++] = moves[i];
         }
     }
 
-    // Special exit cases: Time, Depth, and Nodes
-    limits->limitedByTime  = limits->timeLimit  != 0;
+    limits->limitedByTime = limits->timeLimit != 0;
     limits->limitedByDepth = limits->depthLimit != 0;
-    limits->limitedByNodes = limits->nodeLimit  != 0;
-
-    // No special case nor infinite, so we set our own time
-    limits->limitedBySelf  = !limits->depthLimit    && !limits->timeLimit
+    limits->limitedByNodes = limits->nodeLimit != 0;
+    limits->limitedBySelf = !limits->depthLimit && !limits->timeLimit
                           && !limits->limitedByNone && !limits->nodeLimit;
 
-    // Pick the time values for the colour we are playing as
     limits->start = (board->turn == WHITE) ? start : start;
-    limits->time  = (board->turn == WHITE) ? wtime : btime;
-    limits->inc   = (board->turn == WHITE) ?  winc :  binc;
-    limits->mtg   = (board->turn == WHITE) ?   mtg :   mtg;
+    limits->time = (board->turn == WHITE) ? wtime : btime;
+    limits->inc = (board->turn == WHITE) ? winc : binc;
+    limits->mtg = (board->turn == WHITE) ? mtg : mtg;
 
-    // Cap our MultiPV search based on the suggested or legal moves
     limits->multiPV = MIN(multiPV, limits->limitedByMoves ? idx : size);
 
-    // Prepare the uciGoStruct for the new pthread
-    ucigo->board   = board;
+    ucigo->board = board;
     ucigo->threads = threads;
 
-    // Spawn a new thread to handle the search
     pthread_create(pthread, NULL, &start_search_threads, ucigo);
     pthread_detach(*pthread);
 }
+
 
 void uciSetOption(char *str, Thread **threads, int *multiPV, int *chess960) {
 
